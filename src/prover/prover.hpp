@@ -48,12 +48,16 @@ public:
     vector<ProverRequest *> pendingRequests;   // Queue of pending requests
     ProverRequest *pCurrentRequest;            // Request currently being processed by the prover thread in server mode
     vector<ProverRequest *> completedRequests; // Map uuid -> ProveRequest pointer
+    ProverRequest *executedRequest;
+    bool waitCopy = false;
 
 private:
+    pthread_t executorPthread;// Executor thread
     pthread_t proverPthread;  // Prover thread
     pthread_t cleanerPthread; // Garbage collector
     pthread_mutex_t mutex;    // Mutex to protect the requests queues
     void *pAddress = NULL;
+    void *pAddress2 = NULL;
     void *pAddressStarksRecursiveF = NULL;
     int protocolId;
 public:
@@ -68,6 +72,8 @@ public:
 
     ~Prover();
 
+    void preGenBatchProof(ProverRequest *pProverRequest);
+    void copyFromExecutor();
     void genBatchProof(ProverRequest *pProverRequest);
     void genAggregatedProof(ProverRequest *pProverRequest);
     void genFinalProof(ProverRequest *pProverRequest);
@@ -81,6 +87,8 @@ public:
     void unlock(void) { pthread_mutex_unlock(&mutex); };
 };
 
+
+void *executorThread(void *arg);
 void *proverThread(void *arg);
 void *cleanerThread(void *arg);
 

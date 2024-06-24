@@ -120,6 +120,7 @@ Prover::Prover(Goldilocks &fr,
             sem_init(&pendingRequestSem, 0, 0);
             pthread_mutex_init(&mutex, NULL);
             pCurrentRequest = NULL;
+            pthread_create(&executorPthread, NULL, executorThread, this);
             pthread_create(&proverPthread, NULL, proverThread, this);
             pthread_create(&cleanerPthread, NULL, cleanerThread, this);
 
@@ -147,6 +148,7 @@ Prover::Prover(Goldilocks &fr,
                     zklog.error("Prover::genBatchProof() failed calling malloc() of size " + to_string(polsSize));
                     exitProcess();
                 }
+                pAddress2 = calloc2(uint64_t(1<<23)*751*8, 1);
                 zklog.info("Prover::genBatchProof() successfully allocated " + to_string(polsSize) + " bytes");
             }
 
@@ -207,6 +209,7 @@ Prover::~Prover()
         else
         {
             free2(pAddress);
+            free2(pAddress2);
         }
         free(pAddressStarksRecursiveF);
 #ifdef __USE_CUDA__
@@ -252,7 +255,6 @@ void *proverThread(void *arg)
         // Extract the first pending request (first in, first out)
         pProver->pCurrentRequest = pProver->pendingRequests[0];
         pProver->pCurrentRequest->startTime = time(NULL);
-        pProver->pendingRequests.erase(pProver->pendingRequests.begin());
 
         zklog.info("proverThread() starting to process request with UUID: " + pProver->pCurrentRequest->uuid);
 
@@ -281,6 +283,8 @@ void *proverThread(void *arg)
         // Move to completed requests
         pProver->lock();
         ProverRequest *pProverRequest = pProver->pCurrentRequest;
+        zkassert(pProver->pendingRequests[0]->uuid == pProverRequest->uuid);
+        pProver->pendingRequests.erase(pProver->pendingRequests.begin());
         pProverRequest->endTime = time(NULL);
         pProver->lastComputedRequestId = pProverRequest->uuid;
         pProver->lastComputedRequestEndTime = pProverRequest->endTime;
@@ -295,6 +299,106 @@ void *proverThread(void *arg)
         pProverRequest->notifyCompleted();
     }
     zklog.info("proverThread() done");
+    return NULL;
+}
+
+void Prover::preGenBatchProof(ProverRequest *pProverRequest)
+{
+    /************/
+    /* Executor */
+    /************/
+    TimerStart(EXECUTOR_EXECUTE_INITIALIZATION);
+
+    PROVER_FORK_NAMESPACE::CommitPols cmPols(pAddress2, PROVER_FORK_NAMESPACE::CommitPols::pilDegree());
+    Goldilocks::parSetZero((Goldilocks::Element*)cmPols.address(), cmPols.size()/sizeof(Goldilocks::Element), omp_get_max_threads()/2);
+
+
+    TimerStopAndLog(EXECUTOR_EXECUTE_INITIALIZATION);
+    // Execute all the State Machines
+    TimerStart(EXECUTOR_EXECUTE_BATCH_PROOF);
+    executor.execute(*pProverRequest, cmPols);
+    TimerStopAndLog(EXECUTOR_EXECUTE_BATCH_PROOF);
+
+    uint64_t lastN = cmPols.pilDegree() - 1;
+
+    zklog.info("Prover::genBatchProof() called executor.execute() oldStateRoot=" + pProverRequest->input.publicInputsExtended.publicInputs.oldStateRoot.get_str(16) +
+               " newStateRoot=" + pProverRequest->pFullTracer->get_new_state_root() +
+               " pols.B[0]=" + fea2string(fr, cmPols.Main.B0[0], cmPols.Main.B1[0], cmPols.Main.B2[0], cmPols.Main.B3[0], cmPols.Main.B4[0], cmPols.Main.B5[0], cmPols.Main.B6[0], cmPols.Main.B7[0]) +
+               " pols.SR[lastN]=" + fea2string(fr, cmPols.Main.SR0[lastN], cmPols.Main.SR1[lastN], cmPols.Main.SR2[lastN], cmPols.Main.SR3[lastN], cmPols.Main.SR4[lastN], cmPols.Main.SR5[lastN], cmPols.Main.SR6[lastN], cmPols.Main.SR7[lastN]) +
+               " lastN=" + to_string(lastN));
+    zklog.info("Prover::genBatchProof() called executor.execute() oldAccInputHash=" + pProverRequest->input.publicInputsExtended.publicInputs.oldAccInputHash.get_str(16) +
+               " newAccInputHash=" + pProverRequest->pFullTracer->get_new_acc_input_hash() +
+               " pols.C[0]=" + fea2string(fr, cmPols.Main.C0[0], cmPols.Main.C1[0], cmPols.Main.C2[0], cmPols.Main.C3[0], cmPols.Main.C4[0], cmPols.Main.C5[0], cmPols.Main.C6[0], cmPols.Main.C7[0]) +
+               " pols.D[lastN]=" + fea2string(fr, cmPols.Main.D0[lastN], cmPols.Main.D1[lastN], cmPols.Main.D2[lastN], cmPols.Main.D3[lastN], cmPols.Main.D4[lastN], cmPols.Main.D5[lastN], cmPols.Main.D6[lastN], cmPols.Main.D7[lastN]) +
+               " lastN=" + to_string(lastN));
+
+    // Save commit pols to file zkevm.commit
+    if (config.zkevmCmPolsAfterExecutor != "")
+    {
+        void *pointerCmPols = mapFile(config.zkevmCmPolsAfterExecutor, cmPols.size(), true);
+        memcpy(pointerCmPols, cmPols.address(), cmPols.size());
+        unmapFile(pointerCmPols, cmPols.size());
+    }
+}
+
+void *executorThread(void *arg)
+{
+    Prover *pProver = (Prover *)arg;
+    zklog.info("executorThread() started");
+
+    zkassert(pProver->config.generateProof());
+
+    while (true)
+    {
+        pProver->lock();
+
+        if (pProver->waitCopy)
+        {
+            pProver->unlock();
+            sleep(1);
+            continue;
+        }
+
+        ProverRequest *pProverRequest = NULL;
+        // find the first batch proof request
+        for (uint64_t i = 0; i < pProver->pendingRequests.size(); i++)
+        {
+            if (pProver->pendingRequests[i]->type == prt_genBatchProof && (pProver->executedRequest == NULL || pProver->pendingRequests[i]->uuid != pProver->executedRequest->uuid)) {
+                pProverRequest = pProver->pendingRequests[i];
+                break;
+            }
+        }
+        pProver->unlock();
+
+        if (pProverRequest == NULL)
+        {
+            zklog.info("executorThread() found no batch proof request, so ignoring");
+            sleep(1);
+            continue;
+        }
+
+        zklog.info("executorThread() starting to process request with UUID: " + pProverRequest->uuid);
+
+        // Save input to <timestamp>.input.json, as provided by client
+        if (pProver->config.saveInputToFile)
+        {
+            json inputJson;
+            pProverRequest->input.save(inputJson);
+            json2file(inputJson, pProverRequest->inputFile());
+        }
+
+        pProver->preGenBatchProof(pProverRequest);
+
+        // Push to executed requests
+        pProver->lock();
+        pProver->executedRequest = pProverRequest;
+        pProver->waitCopy = true;
+        pProver->unlock();
+
+        zklog.info("executorThread() done processing request with UUID: " + pProverRequest->uuid);
+    }
+
+    zklog.info("executorThread() done");
     return NULL;
 }
 
@@ -433,6 +537,22 @@ void Prover::processBatch(ProverRequest *pProverRequest)
     //TimerStopAndLog(PROVER_PROCESS_BATCH);
 }
 
+void Prover::copyFromExecutor()
+{
+    zkassert(executedRequest != NULL);
+    int nThreads = omp_get_max_threads();
+    uint64_t total_size = PROVER_FORK_NAMESPACE::CommitPols::pilDegree()*751*sizeof(Goldilocks::Element);
+    uint64_t part_size = total_size / nThreads;
+    uint64_t last_part_size = total_size - part_size * (nThreads - 1);
+#pragma omp parallel for
+    for (int i = 0; i < nThreads; i++)
+    {
+        uint64_t cur_size = i != nThreads -1 ? part_size:last_part_size;
+        memcpy((char *)pAddress + i * part_size, (char *)pAddress2 + i * part_size, cur_size);
+        memset((char *)pAddress2 + i * part_size, 0, cur_size);
+    }
+}
+
 void Prover::genBatchProof(ProverRequest *pProverRequest)
 {
     zkassert(config.generateProof());
@@ -451,52 +571,25 @@ void Prover::genBatchProof(ProverRequest *pProverRequest)
     // zklog.info("Prover::genBatchProof() public file: " + pProverRequest->publicsOutputFile());
     // zklog.info("Prover::genBatchProof() proof file: " + pProverRequest->proofFile());
 
-    // Save input to <timestamp>.input.json, as provided by client
-    if (config.saveInputToFile)
-    {
-        json inputJson;
-        pProverRequest->input.save(inputJson);
-        json2file(inputJson, pProverRequest->inputFile());
+    TimerStart(PROVER_WAIT_EXECUTOR);
+    while(true) {
+        lock();
+        if(waitCopy) {
+            zkassert(executedRequest->uuid == pProverRequest->uuid);
+            copyFromExecutor();
+            waitCopy = false;
+            unlock();
+            break;
+        }
+        unlock();
+        sleep(1);
     }
-
-    /************/
-    /* Executor */
-    /************/
-    TimerStart(EXECUTOR_EXECUTE_INITIALIZATION);
-
-    PROVER_FORK_NAMESPACE::CommitPols cmPols(pAddress, PROVER_FORK_NAMESPACE::CommitPols::pilDegree());
-    Goldilocks::parSetZero((Goldilocks::Element*)pAddress, cmPols.size()/sizeof(Goldilocks::Element), omp_get_max_threads()/2);
-
-
-    TimerStopAndLog(EXECUTOR_EXECUTE_INITIALIZATION);
-    // Execute all the State Machines
-    TimerStart(EXECUTOR_EXECUTE_BATCH_PROOF);
-    executor.execute(*pProverRequest, cmPols);
-    TimerStopAndLog(EXECUTOR_EXECUTE_BATCH_PROOF);
-
-    uint64_t lastN = cmPols.pilDegree() - 1;
-
-    zklog.info("Prover::genBatchProof() called executor.execute() oldStateRoot=" + pProverRequest->input.publicInputsExtended.publicInputs.oldStateRoot.get_str(16) +
-        " newStateRoot=" + pProverRequest->pFullTracer->get_new_state_root() +
-        " pols.B[0]=" + fea2string(fr, cmPols.Main.B0[0], cmPols.Main.B1[0], cmPols.Main.B2[0], cmPols.Main.B3[0], cmPols.Main.B4[0], cmPols.Main.B5[0], cmPols.Main.B6[0], cmPols.Main.B7[0]) +
-        " pols.SR[lastN]=" + fea2string(fr, cmPols.Main.SR0[lastN], cmPols.Main.SR1[lastN], cmPols.Main.SR2[lastN], cmPols.Main.SR3[lastN], cmPols.Main.SR4[lastN], cmPols.Main.SR5[lastN], cmPols.Main.SR6[lastN], cmPols.Main.SR7[lastN]) +
-        " lastN=" + to_string(lastN));
-    zklog.info("Prover::genBatchProof() called executor.execute() oldAccInputHash=" + pProverRequest->input.publicInputsExtended.publicInputs.oldAccInputHash.get_str(16) +
-        " newAccInputHash=" + pProverRequest->pFullTracer->get_new_acc_input_hash() +
-        " pols.C[0]=" + fea2string(fr, cmPols.Main.C0[0], cmPols.Main.C1[0], cmPols.Main.C2[0], cmPols.Main.C3[0], cmPols.Main.C4[0], cmPols.Main.C5[0], cmPols.Main.C6[0], cmPols.Main.C7[0]) +
-        " pols.D[lastN]=" + fea2string(fr, cmPols.Main.D0[lastN], cmPols.Main.D1[lastN], cmPols.Main.D2[lastN], cmPols.Main.D3[lastN], cmPols.Main.D4[lastN], cmPols.Main.D5[lastN], cmPols.Main.D6[lastN], cmPols.Main.D7[lastN]) +
-        " lastN=" + to_string(lastN));
-
-    // Save commit pols to file zkevm.commit
-    if (config.zkevmCmPolsAfterExecutor != "")
-    {
-        void *pointerCmPols = mapFile(config.zkevmCmPolsAfterExecutor, cmPols.size(), true);
-        memcpy(pointerCmPols, cmPols.address(), cmPols.size());
-        unmapFile(pointerCmPols, cmPols.size());
-    }
+    TimerStopAndLog(PROVER_WAIT_EXECUTOR);
 
     if (pProverRequest->result == ZKR_SUCCESS)
     {
+        PROVER_FORK_NAMESPACE::CommitPols cmPols(pAddress, PROVER_FORK_NAMESPACE::CommitPols::pilDegree());
+        uint64_t lastN = cmPols.pilDegree() - 1;
         /*************************************/
         /*  Generate publics input           */
         /*************************************/
